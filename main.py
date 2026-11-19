@@ -37,6 +37,7 @@ and the X-GitHub-Request-Id is a per-process counter.
 import base64
 import email.utils
 import hashlib
+import itertools
 import json
 import os
 import queue
@@ -71,14 +72,13 @@ if not SHOP_TOKEN:
         ("shop-token:" + VIEWER_LOGIN).encode()).hexdigest()[:32]
 
 # Deterministic request ids (a per-process counter, never random/clock).
-_REQ_COUNTER = [0]
-_REQ_LOCK = threading.Lock()
+# itertools.count's next() is a single C call, atomic under the GIL —
+# no lock needed (the previous version took a global lock per response).
+_REQ_COUNT = itertools.count(1)
 
 
 def _next_request_id():
-    with _REQ_LOCK:
-        _REQ_COUNTER[0] += 1
-        return "req-%08x" % _REQ_COUNTER[0]
+    return "req-%08x" % next(_REQ_COUNT)
 
 
 # -- perf: cached response pieces (all deterministic) ----------------
@@ -110,6 +110,46 @@ _FETCH_CACHE = {}
 _FETCH_CACHE_MAX = 512
 
 
+# Monotonic ref-state version, bumped on EVERY mutation of any repo's
+# branches/tags (push, REST ref/file ops, PR merge) and on repo
+# create/delete/fork. The ls-refs cache below keys on it, so a cached
+# response can never outlive the ref state it was computed from. The
+# counter only ever increases, so an entry stored under an old version
+# is simply never looked up again; a lost increment under two
+# concurrent mutations is harmless because the version still advanced
+# past the pre-mutation value. (Repo create/delete/fork bump it too,
+# so a deleted-then-recreated repo with the same (owner, name) cannot
+# reuse a dead entry.)
+_REF_VERSION = [0]
+
+
+def _bump_ref_version():
+    _REF_VERSION[0] += 1
+
+
+# ls-refs responses, keyed by (owner, name, ref-state version,
+# ref-prefixes, peel, symrefs, unborn, default branch) — everything
+# _v2_ls_refs output depends on. Same clear-when-full discipline as
+# _FETCH_CACHE; clearing only costs speed, never correctness.
+_LSREFS_CACHE = {}
+_LSREFS_CACHE_MAX = 512
+
+
+# Bounded memo of parsed request heads, keyed by the exact raw head
+# bytes (request line + header lines through the blank line). Parsing
+# is a pure function of those bytes, so a cached result is always
+# correct; the key includes the whole head, so method, path, query
+# and every header participate. Only heads under 2048 bytes are
+# cached and the dict stops growing at 256 entries. The cached value
+# is an immutable tuple of (lowercased-bytes key, raw-bytes value)
+# pairs; a fresh _Headers is built from it on every hit, so nothing
+# downstream can mutate the cached object (the lazy decode in
+# _Headers.get only ever writes back into that fresh dict).
+_PC = {}
+_PC_MAX = 256
+_PC_MAX_HEAD = 2048
+
+
 class _Headers(dict):
     """A request's headers as a plain dict keyed by lowercased name.
 
@@ -118,10 +158,24 @@ class _Headers(dict):
     the handful of headers our clients send. The forge only ever uses
     .get(name) on the headers, so a lowercased dict is a drop-in
     replacement — first occurrence wins, matching Message.get.
+
+    Keys are lowercased bytes and values are raw (stripped) bytes;
+    .get() decodes the value to iso-8859-1 lazily, only for the
+    headers a request actually reads (typically 3–5 of ~10), and
+    caches the decoded string back into the dict. This skips ~15
+    decode/strip/lower calls per request versus decoding every
+    header eagerly in parse_request.
     """
 
     def get(self, key, default=None):
-        return super().get(key.lower(), default)
+        bkey = key.lower().encode("latin-1")
+        value = super().get(bkey)
+        if value is None:
+            return default
+        if isinstance(value, bytes):
+            value = value.decode("iso-8859-1")
+            self[bkey] = value
+        return value
 
 
 def _deterministic_token(login):
@@ -659,6 +713,7 @@ def set_branch_to_commit(repo, branch, commit_sha):
     tree, _parents = commit_tree_and_parents(commit_sha)
     files = tree_files(tree) if tree else {}
     repo["branches"][branch] = {"commit": commit_sha, "files": files}
+    _bump_ref_version()
 
 
 def commit_file(repo, branch_name, path, content, message, author):
@@ -669,6 +724,7 @@ def commit_file(repo, branch_name, path, content, message, author):
     sha = make_commit(tree, branch["commit"], message, author)
     branch["commit"] = sha
     branch["files"] = files
+    _bump_ref_version()
     return sha
 
 
@@ -838,6 +894,40 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def handle_one_request(self):
+        # Faithful copy of BaseHTTPRequestHandler.handle_one_request
+        # with one change: dispatch goes straight to _handle() for the
+        # five methods this forge serves, instead of hasattr + getattr
+        # lookups for a do_* method (every do_* just calls _handle()).
+        # All other behaviour — the 65536 request-line limit (414),
+        # empty-line close, 501 for unknown methods with the same
+        # message, the post-request wfile.flush, TimeoutError handling
+        # — is identical.
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(414)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                return
+            if self.command in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                self._handle()
+            else:
+                self.send_error(
+                    501, "Unsupported method (%r)" % self.command)
+                return
+            self.wfile.flush()
+        except TimeoutError as exc:
+            self.log_error("Request timed out: %r", exc)
+            self.close_connection = True
+            return
+
     def parse_request(self):
         """Lean request-line + header parsing (see _Headers).
 
@@ -860,27 +950,34 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if len(words) >= 3:  # Enough to determine protocol version
             version = words[-1]
-            try:
-                if not version.startswith("HTTP/"):
-                    raise ValueError
-                base_version_number = version.split("/", 1)[1]
-                version_number = base_version_number.split(".")
-                if len(version_number) != 2:
-                    raise ValueError
-                if any(not component.isdigit() for component in version_number):
-                    raise ValueError("non digit in http version")
-                if any(len(component) > 10 for component in version_number):
-                    raise ValueError("unreasonable length http version")
-                version_number = int(version_number[0]), int(version_number[1])
-            except (ValueError, IndexError):
-                self.send_error(400, "Bad request version (%r)" % version)
-                return False
-            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+            if version == "HTTP/1.1":
+                # The overwhelmingly common case: "HTTP/1.1" passes
+                # the validation below by construction, so skip the
+                # splits, any() scans and int() conversions.
+                self.request_version = version
                 self.close_connection = False
-            if version_number >= (2, 0):
-                self.send_error(505, "Invalid HTTP version (%s)" % base_version_number)
-                return False
-            self.request_version = version
+            else:
+                try:
+                    if not version.startswith("HTTP/"):
+                        raise ValueError
+                    base_version_number = version.split("/", 1)[1]
+                    version_number = base_version_number.split(".")
+                    if len(version_number) != 2:
+                        raise ValueError
+                    if any(not component.isdigit() for component in version_number):
+                        raise ValueError("non digit in http version")
+                    if any(len(component) > 10 for component in version_number):
+                        raise ValueError("unreasonable length http version")
+                    version_number = int(version_number[0]), int(version_number[1])
+                except (ValueError, IndexError):
+                    self.send_error(400, "Bad request version (%r)" % version)
+                    return False
+                if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                    self.close_connection = False
+                if version_number >= (2, 0):
+                    self.send_error(505, "Invalid HTTP version (%s)" % base_version_number)
+                    return False
+                self.request_version = version
         if not 2 <= len(words) <= 3:
             self.send_error(400, "Bad request syntax (%r)" % requestline)
             return False
@@ -893,37 +990,54 @@ class Handler(BaseHTTPRequestHandler):
         self.command, self.path = command, path
         if self.path.startswith("//"):
             self.path = "/" + self.path.lstrip("/")
-        # Headers: one readline per header, `name: value`, into a
-        # lowercased dict (first occurrence wins, like Message.get).
-        # Same limits as http.client.parse_headers: 65536 bytes per
-        # line, 100 headers.
-        headers = _Headers()
-        count = 0
-        last_key = None
+        # Headers: read the raw lines first (same 65536-byte line
+        # limit), then parse them — from the memo when this exact head
+        # was seen before. The request line was already validated
+        # above, so only the header parse is memoized.
+        raw_lines = []
         while True:
             line = self.rfile.readline(65537)
             if len(line) > 65536:
                 self.send_error(431, "Line too long")
                 return False
+            raw_lines.append(line)
             if line in (b"\r\n", b"\n", b""):
                 break
-            if line[:1] in (b" ", b"\t") and last_key is not None:
-                # Continuation line: fold into the previous header.
-                headers[last_key] += " " + line.strip().decode("iso-8859-1")
-                continue
-            if b":" not in line:
-                continue
-            count += 1
-            if count > 100:
-                self.send_error(431, "Too many headers")
+        key = self.raw_requestline + b"".join(raw_lines)
+        cached = _PC.get(key)
+        if cached is not None:
+            headers = _Headers(cached)
+        else:
+            headers = _Headers()
+            count = 0
+            last_key = None
+            ok = True
+            for line in raw_lines:
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                if line[:1] in (b" ", b"\t") and last_key is not None:
+                    # Continuation line: fold into the previous header.
+                    # Values stay bytes here; _Headers.get decodes lazily.
+                    headers[last_key] += b" " + line.strip()
+                    continue
+                if b":" not in line:
+                    continue
+                count += 1
+                if count > 100:
+                    self.send_error(431, "Too many headers")
+                    ok = False
+                    break
+                name, _, value = line.partition(b":")
+                hkey = name.strip().lower()
+                if hkey not in headers:
+                    headers[hkey] = value.strip()
+                    last_key = hkey
+                else:
+                    last_key = None
+            if not ok:
                 return False
-            name, _, value = line.partition(b":")
-            key = name.strip().decode("iso-8859-1").lower()
-            if key not in headers:
-                headers[key] = value.strip().decode("iso-8859-1")
-                last_key = key
-            else:
-                last_key = None
+            if len(key) < _PC_MAX_HEAD and len(_PC) < _PC_MAX:
+                _PC[key] = tuple(headers.items())
         self.headers = headers
         conntype = self.headers.get("Connection", "")
         if conntype.lower() == "close":
@@ -1001,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                 b"X-GitHub-Request-Id: %s\r\n" % (
                     self.protocol_version.encode("latin-1"), status,
                     reason.encode("latin-1"),
-                    self.version_string().encode("latin-1"),
+                    _SEND_VERSION,
                     _http_date(), ctype.encode("latin-1"), len(data),
                     _next_request_id().encode("latin-1")))
         if extra:
@@ -1256,8 +1370,16 @@ class Handler(BaseHTTPRequestHandler):
                 elif line == "unborn":
                     want_unborn = True
             if command == "ls-refs":
-                out = self._v2_ls_refs(repo, ref_prefixes, want_peel,
-                                       want_symrefs, want_unborn)
+                key = ("ls-refs", owner, name, _REF_VERSION[0],
+                       tuple(ref_prefixes), want_peel, want_symrefs,
+                       want_unborn, repo["default_branch"])
+                out = _LSREFS_CACHE.get(key)
+                if out is None:
+                    out = self._v2_ls_refs(repo, ref_prefixes, want_peel,
+                                           want_symrefs, want_unborn)
+                    if len(_LSREFS_CACHE) >= _LSREFS_CACHE_MAX:
+                        _LSREFS_CACHE.clear()
+                    _LSREFS_CACHE[key] = out
                 self._send(200, out, "application/x-git-upload-pack-result")
                 return
             if command == "fetch":
@@ -1561,12 +1683,15 @@ class Handler(BaseHTTPRequestHandler):
             for ref, action, arg, new_sha in decisions:
                 if action == "delete":
                     del repo["branches"][arg]
+                    _bump_ref_version()
                 elif action in ("create", "update"):
                     set_branch_to_commit(repo, arg, new_sha)
                 elif action == "delete-tag":
                     del repo["tags"][arg]
+                    _bump_ref_version()
                 elif action == "create-tag":
                     repo["tags"][arg] = new_sha
+                    _bump_ref_version()
         resp = pkt(b"unpack ok\n")
         for ref, action, arg, _new_sha in decisions:
             if action == "ng":
@@ -1780,6 +1905,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             repo = new_repo(auth_user["login"], name, body.get("description"), body.get("private", False))
             REPOS[(auth_user["login"], name)] = repo
+            _bump_ref_version()
             self._send(201, repo_json(repo, base))
             return
         if seg == ["user", "repos"] and method == "GET":
@@ -1852,6 +1978,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(403, "Forbidden")
                 return
             del REPOS[(owner, name)]
+            _bump_ref_version()
             self._send(204, b"")
             return
         if rest == ["branches"] and method == "GET":
@@ -1880,6 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
             fork["branches"] = {b: {"commit": s["commit"], "files": dict(s["files"])}
                                 for b, s in repo["branches"].items()}
             REPOS[(user["login"], name)] = fork
+            _bump_ref_version()
             repo["forks_count"] += 1
             self._send(202, repo_json(fork, base))
             return
@@ -2021,6 +2149,7 @@ class Handler(BaseHTTPRequestHandler):
             branch = full[len("refs/heads/"):] if full.startswith("refs/heads/") else None
             if branch and branch in repo["branches"]:
                 del repo["branches"][branch]
+                _bump_ref_version()
                 self._send(204, b"")
             else:
                 self._error(404, "Not Found")
@@ -2099,6 +2228,7 @@ class Handler(BaseHTTPRequestHandler):
                     sha = make_commit(tree, branch["commit"], message, user["login"])
                     branch["commit"] = sha
                     branch["files"] = files
+                    _bump_ref_version()
                     self._send(200, {"commit": {"sha": sha}})
                     return
                 content = body.get("content", "")
@@ -2312,6 +2442,11 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, "Not Found")
 
 
+# Precomputed "Server" header value: BaseHTTPRequestHandler.version_string()
+# is server_version + " " + sys_version, constant for the process.
+_SEND_VERSION = (Handler.server_version + " " + Handler.sys_version).encode("latin-1")
+
+
 def _do_squash_merge(repo, pr, author_login):
     """Squash-merge an open, mergeable pull request onto its base branch.
 
@@ -2334,6 +2469,7 @@ def _do_squash_merge(repo, pr, author_login):
     merge_sha = make_commit(tree, base_sha, message, author_login)
     base_state["commit"] = merge_sha
     base_state["files"] = merged_files
+    _bump_ref_version()
     pr["state"] = "closed"
     pr["merged"] = True
     pr["merged_at"] = FIXED_TIME
@@ -3443,6 +3579,7 @@ def _mcp_call_tool(tool_name, args, user, base):
             return None, {"code": -32602, "message": "Repository already exists"}
         repo = new_repo(user["login"], name, args.get("description"), bool(args.get("private", False)))
         REPOS[(user["login"], name)] = repo
+        _bump_ref_version()
         data = repo_json(repo, base)
         return _mcp_tool_result(data), None
     if tool_name == "get_repo":
