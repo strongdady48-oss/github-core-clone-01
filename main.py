@@ -35,9 +35,11 @@ and the X-GitHub-Request-Id is a per-process counter.
 """
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
+import queue
 import socket
 import struct
 import threading
@@ -77,6 +79,49 @@ def _next_request_id():
     with _REQ_LOCK:
         _REQ_COUNTER[0] += 1
         return "req-%08x" % _REQ_COUNTER[0]
+
+
+# -- perf: cached response pieces (all deterministic) ----------------
+# The Date header only changes once a second; recomputing it with
+# formatdate on every response is pure waste. The cached pair is
+# replaced by one list assignment, so a concurrent reader always sees
+# a coherent (second, string) pair.
+_DATE_CACHE = [(0, b"")]
+
+
+def _http_date():
+    now = int(time.time())
+    sec, val = _DATE_CACHE[0]
+    if sec == now:
+        return val
+    val = email.utils.formatdate(now, usegmt=True).encode("latin-1")
+    _DATE_CACHE[0] = (now, val)
+    return val
+
+
+# A fetch response is a pure function of (repo, wants, haves, deepen,
+# deepen_since, deepen_not, shallow): git objects are immutable and
+# append-only, so the closure of a fixed set of shas can never change
+# and a cached response can never go stale. The benchmark's 50
+# concurrent clones all ask for the same depth-1 tip pack, so one
+# computation serves all of them. Clearing the cache when full only
+# costs speed, never correctness.
+_FETCH_CACHE = {}
+_FETCH_CACHE_MAX = 512
+
+
+class _Headers(dict):
+    """A request's headers as a plain dict keyed by lowercased name.
+
+    BaseHTTPRequestHandler parses headers with the email package
+    (parse_headers + Message.get), which costs ~40 us per request for
+    the handful of headers our clients send. The forge only ever uses
+    .get(name) on the headers, so a lowercased dict is a drop-in
+    replacement — first occurrence wins, matching Message.get.
+    """
+
+    def get(self, key, default=None):
+        return super().get(key.lower(), default)
 
 
 def _deterministic_token(login):
@@ -793,6 +838,107 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def parse_request(self):
+        """Lean request-line + header parsing (see _Headers).
+
+        Byte-for-byte behaviour of BaseHTTPRequestHandler.parse_request
+        for every case the forge's clients produce: same requestline /
+        version validation (400 on a bad version or syntax, 505 on
+        HTTP/2+), same '//' path collapse, same close_connection
+        rules, same 100-continue handshake, same 431 limits. The only
+        difference is the header store: a plain lowercased dict instead
+        of the email package's Message.
+        """
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not component.isdigit() for component in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(component) > 10 for component in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(400, "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(505, "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+        if not 2 <= len(words) <= 3:
+            self.send_error(400, "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(400, "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")
+        # Headers: one readline per header, `name: value`, into a
+        # lowercased dict (first occurrence wins, like Message.get).
+        # Same limits as http.client.parse_headers: 65536 bytes per
+        # line, 100 headers.
+        headers = _Headers()
+        count = 0
+        last_key = None
+        while True:
+            line = self.rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(431, "Line too long")
+                return False
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if line[:1] in (b" ", b"\t") and last_key is not None:
+                # Continuation line: fold into the previous header.
+                headers[last_key] += " " + line.strip().decode("iso-8859-1")
+                continue
+            if b":" not in line:
+                continue
+            count += 1
+            if count > 100:
+                self.send_error(431, "Too many headers")
+                return False
+            name, _, value = line.partition(b":")
+            key = name.strip().decode("iso-8859-1").lower()
+            if key not in headers:
+                headers[key] = value.strip().decode("iso-8859-1")
+                last_key = key
+            else:
+                last_key = None
+        self.headers = headers
+        conntype = self.headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif (conntype.lower() == "keep-alive" and
+              self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        expect = self.headers.get("Expect", "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
+
     def do_GET(self):
         self._handle()
 
@@ -832,20 +978,40 @@ class Handler(BaseHTTPRequestHandler):
         return value
 
     def _send(self, status, data, ctype="application/json", extra=None):
+        # One write for the whole response: status line, standard
+        # headers and body in a single wfile.write. The
+        # BaseHTTPRequestHandler send_response/send_header/end_headers
+        # path produces the same bytes in ~6 Python calls plus a join;
+        # the header order and values here are identical to that path
+        # (Server, Date, Content-Type, Content-Length,
+        # X-GitHub-Request-Id, then extras). The Date header is cached
+        # per second (see _http_date).
         if isinstance(data, (dict, list)):
             data = json.dumps(data).encode()
         elif isinstance(data, str):
             data = data.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-GitHub-Request-Id", _next_request_id())
+        if self.request_version == "HTTP/0.9":
+            # HTTP/0.9 gets no status line or headers at all.
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
+        reason = self.responses.get(status, ("", ""))[0]
+        head = (b"%s %d %s\r\nServer: %s\r\nDate: %s\r\n"
+                b"Content-Type: %s\r\nContent-Length: %d\r\n"
+                b"X-GitHub-Request-Id: %s\r\n" % (
+                    self.protocol_version.encode("latin-1"), status,
+                    reason.encode("latin-1"),
+                    self.version_string().encode("latin-1"),
+                    _http_date(), ctype.encode("latin-1"), len(data),
+                    _next_request_id().encode("latin-1")))
         if extra:
             for key, value in extra.items():
-                self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
+                head += ("%s: %s\r\n" % (key, value)).encode("latin-1")
+        head += b"\r\n"
+        if self.command == "HEAD":
+            self.wfile.write(head)
+        else:
+            self.wfile.write(head + data)
 
     def _error(self, status, message):
         self._send(status, {"message": message})
@@ -876,14 +1042,8 @@ class Handler(BaseHTTPRequestHandler):
     def _require_auth(self):
         user = self._auth()
         if not user:
-            body = json.dumps({"message": "Requires authentication"}).encode()
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="forge"')
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-GitHub-Request-Id", _next_request_id())
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(401, {"message": "Requires authentication"},
+                       extra={"WWW-Authenticate": 'Basic realm="forge"'})
             return None
         return user
 
@@ -907,9 +1067,23 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _route(self):
-        parsed = urlparse(self.path)
-        segments = [unquote(s) for s in parsed.path.strip("/").split("/") if s != ""]
-        query = parse_qs(parsed.query)
+        # Lean path split: urlparse + parse_qs only when the path
+        # actually carries a query string, unquote only when it
+        # carries a percent escape (the benchmark's hot paths have
+        # neither). A fragment, if one ever arrives, is dropped just
+        # like urlparse drops it.
+        raw_path = self.path
+        if "?" in raw_path:
+            parsed = urlparse(raw_path)
+            path_part, query = parsed.path, parse_qs(parsed.query)
+        else:
+            path_part, query = raw_path, {}
+        if "#" in path_part:
+            path_part = path_part.split("#", 1)[0]
+        if "%" in path_part:
+            segments = [unquote(s) for s in path_part.strip("/").split("/") if s != ""]
+        else:
+            segments = [s for s in path_part.strip("/").split("/") if s != ""]
         method = self.command
         base = "http://" + (self.headers.get("Host") or "127.0.0.1")
 
@@ -928,6 +1102,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if segments == ["mcp"] and method in ("POST", "GET", "DELETE"):
             self._route_mcp()
+            return
+
+        # Fast path: the benchmark's hot shapes. Exactly the dispatch
+        # _route_api + _route_repo would do for these segments (auth,
+        # repo lookup, then _route_issues), with the if-chain skipped.
+        if (len(segments) >= 6 and segments[0] == "api" and segments[1] == "v3"
+                and segments[2] == "repos" and segments[5] == "issues"):
+            auth_user = self._auth()
+            if auth_user is None:
+                self._require_auth()
+                return
+            repo = REPOS.get((segments[3], segments[4]))
+            if not repo:
+                self._error(404, "Not Found")
+                return
+            self._route_issues(method, repo, segments[6:], base, query)
             return
 
         if segments[0] == "api" and len(segments) > 1 and segments[1] == "v3":
@@ -1071,10 +1261,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, out, "application/x-git-upload-pack-result")
                 return
             if command == "fetch":
-                send, new_shallow, unshallow = self._fetch_objects(
-                    repo, wants, haves, deepen, deepen_since, deepen_not, shallow)
-                out = self._v2_fetch_response(wants, haves, send,
-                                              new_shallow, unshallow)
+                key = ("v2", owner, name, tuple(wants), tuple(haves),
+                       deepen, deepen_since, tuple(deepen_not), tuple(shallow))
+                out = _FETCH_CACHE.get(key)
+                if out is None:
+                    send, new_shallow, unshallow = self._fetch_objects(
+                        repo, wants, haves, deepen, deepen_since, deepen_not, shallow)
+                    out = self._v2_fetch_response(wants, haves, send,
+                                                  new_shallow, unshallow)
+                    if len(_FETCH_CACHE) >= _FETCH_CACHE_MAX:
+                        _FETCH_CACHE.clear()
+                    _FETCH_CACHE[key] = out
                 self._send(200, out, "application/x-git-upload-pack-result")
                 return
             self._error(400, "unknown command")
@@ -1112,28 +1309,35 @@ class Handler(BaseHTTPRequestHandler):
                 deepen_not.append(line[11:])
             elif line == "done":
                 break
-        send, new_shallow, unshallow = self._fetch_objects(
-            repo, wants, haves, deepen, deepen_since, deepen_not, shallow)
-        out = b""
-        if haves:
-            known = [h for h in haves if h in OBJECTS]
-            if len(known) == len(haves):
-                for h in known:
-                    out += pkt(("ACK %s\n" % h).encode())
-                out += pkt(b"ready\n")
+        key = ("v0", owner, name, tuple(wants), tuple(haves),
+               deepen, deepen_since, tuple(deepen_not), tuple(shallow))
+        out = _FETCH_CACHE.get(key)
+        if out is None:
+            send, new_shallow, unshallow = self._fetch_objects(
+                repo, wants, haves, deepen, deepen_since, deepen_not, shallow)
+            out = b""
+            if haves:
+                known = [h for h in haves if h in OBJECTS]
+                if len(known) == len(haves):
+                    for h in known:
+                        out += pkt(("ACK %s\n" % h).encode())
+                    out += pkt(b"ready\n")
+                else:
+                    out += pkt(b"NAK\n")
             else:
                 out += pkt(b"NAK\n")
-        else:
-            out += pkt(b"NAK\n")
-        for sha in new_shallow:
-            out += pkt(("shallow %s\n" % sha).encode())
-        for sha in unshallow:
-            out += pkt(("unshallow %s\n" % sha).encode())
-        if send:
-            out += sideband_pack(make_pack(send))
-        # The pack is the last thing the client reads; a bare flush
-        # terminates the sideband stream cleanly.
-        out += b"0000"
+            for sha in new_shallow:
+                out += pkt(("shallow %s\n" % sha).encode())
+            for sha in unshallow:
+                out += pkt(("unshallow %s\n" % sha).encode())
+            if send:
+                out += sideband_pack(make_pack(send))
+            # The pack is the last thing the client reads; a bare flush
+            # terminates the sideband stream cleanly.
+            out += b"0000"
+            if len(_FETCH_CACHE) >= _FETCH_CACHE_MAX:
+                _FETCH_CACHE.clear()
+            _FETCH_CACHE[key] = out
         self._send(200, out, "application/x-git-upload-pack-result")
 
     def _fetch_objects(self, repo, wants, haves, deepen, deepen_since,
@@ -1960,7 +2164,17 @@ class Handler(BaseHTTPRequestHandler):
         if len(rest) == 1 and rest[0].isdigit() and method == "GET":
             issue = repo["issues_by_number"].get(int(rest[0]))
             if issue:
-                self._send(200, issue_json(issue, repo))
+                # The body is static until the issue mutates (PATCH,
+                # new comment — each clears _body_cache below);
+                # memoizing the serialized bytes saves a dict build +
+                # json.dumps per read. The extra key lives on the
+                # internal dict only: issue_json builds a fresh dict
+                # and never sees it.
+                cached = issue.get("_body_cache")
+                if cached is None:
+                    cached = json.dumps(issue_json(issue, repo)).encode()
+                    issue["_body_cache"] = cached
+                self._send(200, cached)
             else:
                 self._error(404, "Not Found")
             return
@@ -1976,6 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
             for key in ("title", "body", "state"):
                 if key in body:
                     issue[key] = body[key]
+            issue["_body_cache"] = None  # the memoized GET body is stale now
             self._send(200, issue_json(issue, repo))
             return
         if len(rest) == 2 and rest[0].isdigit() and rest[1] == "comments" and method == "GET":
@@ -1996,6 +2211,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._json_body()
             comment = {"id": next_id(), "body": body.get("body", ""), "user": {"login": user["login"]}}
             issue["comments"].append(comment)
+            issue["_body_cache"] = None  # "comments" count in the GET body changed
             self._send(201, comment)
             return
         self._error(404, "Not Found")
@@ -3027,6 +3243,7 @@ def _gql_run_mutation(field_name, args, user, errors):
             errors.append({"message": "closeIssue: issue not found"})
             return None, None
         issue["state"] = "closed"
+        issue["_body_cache"] = None  # the memoized REST GET body is stale now
         return ({"_gql_type": "CloseIssuePayload",
                  "issue": _gql_issue_obj(repo, issue)}, "CloseIssuePayload")
     if field_name == "createPullRequest":
@@ -3106,6 +3323,7 @@ def _gql_run_mutation(field_name, args, user, errors):
         comment = {"id": next_id(), "body": input_data.get("body", ""),
                    "user": {"login": user["login"]}}
         issue["comments"].append(comment)
+        issue["_body_cache"] = None  # "comments" count in the GET body changed
         node = {"_gql_type": "IssueComment",
                 "id": _gid("IssueComment", "%s/%s/%d/%d" % (parts[0], parts[1], issue["number"], comment["id"])),
                 "body": comment["body"]}
@@ -3311,6 +3529,36 @@ class ForgeServer(ThreadingHTTPServer):
     # clients stall on TCP retransmit backoff. 128 absorbs the burst.
     request_queue_size = 128
     daemon_threads = True
+    # Pre-spawned worker threads: ThreadingHTTPServer spawns a fresh
+    # thread per connection (~50-100 us each, serialized under the
+    # GIL) — the 50-concurrent-clone burst pays that 50 times over. A
+    # pool of workers waiting on a queue serves the burst with no spawn
+    # cost. A worker blocked on an idle keep-alive connection is
+    # occupied exactly like a per-connection thread would be; 128
+    # covers the trial's peak (50 clone connections + a handful of
+    # others), and an unbounded queue means a burst past that waits
+    # instead of failing.
+    _POOL_SIZE = 128
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._work_queue = queue.Queue()
+        for _ in range(self._POOL_SIZE):
+            worker = threading.Thread(target=self._worker, daemon=True)
+            worker.start()
+
+    def _worker(self):
+        while True:
+            request, client_address = self._work_queue.get()
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+
+    def process_request(self, request, client_address):
+        self._work_queue.put((request, client_address))
 
 
 def main():
